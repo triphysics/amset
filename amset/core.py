@@ -234,7 +234,6 @@ class Amset(MSONable, LoggableMixin):
         self.num_electrons = num_electrons
 
         # TODO use these rather than set material params etc.
-        # also remove deepcopy
         self._material_params = deepcopy(material_params)
         self._model_params = deepcopy(model_params)
         self._performance_params = deepcopy(performance_params)
@@ -259,7 +258,7 @@ class Amset(MSONable, LoggableMixin):
 
         self.interp_params = None
         if self.interpolation == "boltztrap2":
-            bz2_data = PymatgenLoader(band_structure, num_electrons)
+            bz2_data = BandstructureLoader(band_structure, num_electrons)
             equivalences = sphere.get_equivalences(atoms=bz2_data.atoms,
                                                    nkpt=len(
                                                        bz2_data.kpoints) * 5,
