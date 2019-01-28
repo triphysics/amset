@@ -1,58 +1,55 @@
 # coding: utf-8
 from __future__ import absolute_import
+
 import cProfile
 import json
-from itertools import count
-
-import numpy as np
 import os
 import time
 import warnings
-
+from collections import OrderedDict
+from copy import deepcopy
+from itertools import count
+from math import log, pi
+from multiprocessing import cpu_count
 from os.path import join as path_join
+from pprint import pformat
+from pstats import Stats
+from sys import stdout
+
+import numpy as np
+from monty.json import MontyEncoder, MSONable, MontyDecoder
+from monty.serialization import dumpfn, loadfn
+from scipy.interpolate import griddata
 
 from amset.logging import LoggableMixin
-from amset.utils.analytical_band_from_bzt1 import Analytical_bands
-from amset.utils.band_parabolic import get_dos_from_parabolic_bands, \
-    get_parabolic_energy
-from amset.utils.band_interpolation import interpolate_bs, get_energy_args, \
-    get_bs_extrema, get_dos_boltztrap2
-from amset.utils.band_structure import get_bindex_bspin, \
-    remove_duplicate_kpoints, \
-    get_closest_k, generate_adaptive_kmesh, get_dft_orbitals
-from amset.utils.constants import hbar, m_e, A_to_m, m_to_cm, A_to_nm, e, k_B, \
-    epsilon_0, default_small_E, dTdz, sq3
-from amset.utils.general import norm, cos_angle, remove_from_grid, get_angle, \
-    sort_angles, AmsetError
-from amset.utils.k_integration import generate_k_mesh_axes, create_grid, \
-    array_to_kgrid, normalize_array
-
-from amset.utils.pymatgen_loader_for_bzt2 import PymatgenLoader
-from amset.utils.transport import f0, df0dE, fermi_integral, calculate_Sio, \
-    get_tp, free_e_dos
-from amset.utils.plotting import get_amset_plots
 from amset.scattering.elastic import (
     IonizedImpurityScattering, AcousticDeformationScattering,
     PiezoelectricScattering, DislocationScattering)
-
+from amset.utils.analytical_band_from_bzt1 import Analytical_bands
+from amset.utils.band_interpolation import interpolate_bs, get_energy_args, \
+    get_bs_extrema, get_dos_boltztrap2
+from amset.utils.band_parabolic import get_dos_from_parabolic_bands, \
+    get_parabolic_energy
+from amset.utils.band_structure import get_bindex_bspin, \
+    remove_duplicate_kpoints, \
+    get_closest_k, generate_adaptive_kmesh, get_band_orbital_contributions
+from amset.utils.constants import hbar, m_e, A_to_m, m_to_cm, A_to_nm, e, k_B, \
+    epsilon_0, default_small_E, dTdz, sq3
+from amset.utils.general import norm, cos_angle, remove_from_grid, get_angle, \
+    sort_angles, AmsetError, get_tp
+from amset.utils.k_integration import generate_k_mesh_axes, create_grid, \
+    array_to_kgrid, normalize_array
+from amset.plotting import get_amset_plots
+from amset.utils.transport import f0, df0de, fermi_integral, calculate_sio, \
+    free_e_dos
 from amset.valley import Valley
-
-from collections import OrderedDict
-from copy import deepcopy
-from math import log, pi
-from monty.json import MontyEncoder, MSONable, MontyDecoder, getargspec
-from monty.serialization import dumpfn, loadfn
-from multiprocessing import cpu_count
-from pprint import pformat
-from pstats import Stats
 from pymatgen.electronic_structure.boltztrap import BoltztrapRunner
 from pymatgen.io.vasp import Vasprun, Spin, Kpoints
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
-from scipy.interpolate import griddata
-from sys import stdout
 
 try:
     from BoltzTraP2 import sphere, fite
+    from pymatgen.electronic_structure.boltztrap2 import BandstructureLoader
 except ImportError:
     warnings.warn(
         'BoltzTraP2 not imported; "boltztrap2" interpolation not available.')
@@ -66,7 +63,7 @@ __status__ = "Development"
 
 _doping_names = {"n": "conduction band(s)", "p": "valence band(s)"}
 _inst_args = ['kgrid0', 'egrid0', 'kgrid_tp', 'cbm_vbm', 'mobility',
-                  'seebeck', 'elastic_scats', 'inelastic_scats', 'Efrequency0']
+              'seebeck', 'elastic_scats', 'inelastic_scats', 'Efrequency0']
 
 
 class Amset(MSONable, LoggableMixin):
@@ -214,7 +211,8 @@ class Amset(MSONable, LoggableMixin):
                 perturbation function, scattering rates, etc.
      """
 
-    def __init__(self, band_structure, num_electrons, material_params, calc_dir=None,
+    def __init__(self, band_structure, num_electrons, material_params,
+                 calc_dir=None,
                  model_params=None, performance_params=None,
                  dopings=None, temperatures=None, integration='e', logger=True,
                  log_level=None, timeout_hours=48):
@@ -222,7 +220,12 @@ class Amset(MSONable, LoggableMixin):
         self._logger = self.get_logger(logger, level=log_level)
         self._log_level = log_level
 
-        if integration != 'e':
+        if integration == 'k':
+            self.logger.warning(
+                "k-integration is not fully implemented! The results may be"
+                "unreliable, especially for non-cubic systems. 'e'-integration "
+                "is recommended.")
+        elif integration != 'e':
             self.log_raise(ValueError, 'Only "e" integration supported.')
 
         if band_structure.is_metal():
@@ -258,7 +261,9 @@ class Amset(MSONable, LoggableMixin):
 
         self.interp_params = None
         if self.interpolation == "boltztrap2":
-            bz2_data = BandstructureLoader(band_structure, num_electrons)
+            bz2_data = BandstructureLoader(
+                band_structure, structure=band_structure.structure,
+                nelect=num_electrons)
             equivalences = sphere.get_equivalences(atoms=bz2_data.atoms,
                                                    nkpt=len(
                                                        bz2_data.kpoints) * 5,
@@ -323,13 +328,6 @@ class Amset(MSONable, LoggableMixin):
         self.seebeck = {'n': None, 'p': None}
         self.start_time = None
 
-        self.logger.info('integration: {}'.format(self.integration))
-        self.logger.info("number of cpu used (n_jobs): {}".format(self.n_jobs))
-        self.logger.debug('direct lattice matrix:\n{}'.format(
-            self.structure.lattice.matrix))
-        self.logger.info("cell volume = {} A**3".format(self.structure.volume))
-        self.logger.info("original cbm_vbm:\n {}".format(cbm_vbm))
-
     @staticmethod
     def from_vasprun(vasprun, material_params, **kwargs):
         if isinstance(vasprun, str):
@@ -381,6 +379,12 @@ class Amset(MSONable, LoggableMixin):
 
         self.logger.info('Running Amset on {}'.format(
             self.structure.composition.reduced_formula))
+        self.logger.info('integration: {}'.format(self.integration))
+        self.logger.info("number of cpu used (n_jobs): {}".format(self.n_jobs))
+        self.logger.debug('direct lattice matrix:\n{}'.format(
+            self.structure.lattice.matrix))
+        self.logger.info("cell volume = {} A**3".format(self.structure.volume))
+        self.logger.info("original cbm_vbm:\n {}".format(self.cbm_vbm))
         self.kgrid_tp = kgrid_tp
         self.logger.info(
             'Running on "{}" mesh for each valley'.format(kgrid_tp))
@@ -389,6 +393,7 @@ class Amset(MSONable, LoggableMixin):
         self.logger.info('max_nbands={}'.format(self.max_nbands))
         self.logger.info('max_nvalleys={}'.format(self.max_nvalleys))
         self.logger.info('max_normk={}'.format(self.max_normk))
+
         coeff_file = self._initialize_transport_vars(coeff_file=coeff_file)
         # make the reference energy consistent w/ interpolation rather than DFT
         self.update_cbm_vbm_dos(coeff_file=coeff_file)
@@ -647,7 +652,7 @@ class Amset(MSONable, LoggableMixin):
                                                                             fermi,
                                                                             T) * 1.0
                                     self.kgrid[tp]["df0dk"][c][T][ib][
-                                        ik] = hbar * df0dE(E, fermi,
+                                        ik] = hbar * df0de(E, fermi,
                                                            T) * v  # in cm
                                     self.kgrid[tp]["electric force"][c][T][ib][
                                         ik] = \
@@ -980,7 +985,8 @@ class Amset(MSONable, LoggableMixin):
         self.dv_grid = {}
         kpts = {}
         if self.integration == 'e':
-            kpts = generate_adaptive_kmesh(self.band_structure, important_points, kgrid_tp)
+            kpts = generate_adaptive_kmesh(self.band_structure,
+                                           important_points, kgrid_tp)
         for tp in ['n', 'p']:
             points_1d = generate_k_mesh_axes(important_points[tp], kgrid_tp,
                                              one_list=True)
@@ -1213,10 +1219,12 @@ class Amset(MSONable, LoggableMixin):
                         width=self.dos_bwidth,
                         scissor=self.scissor, vbmidx=self.cbm_vbm["p"]["bidx"])
                     self.logger.debug("dos_nbands: {} \n".format(dos_nbands))
-                    self.dos_start = min(self.band_structure.as_dict()["bands"]["1"][bmin]) \
+                    self.dos_start = min(
+                        self.band_structure.as_dict()["bands"]["1"][bmin]) \
                                      + self.offset_from_vrun['p']
                     self.dos_end = max(
-                        self.band_structure.as_dict()["bands"]["1"][bmin + dos_nbands]) \
+                        self.band_structure.as_dict()["bands"]["1"][
+                            bmin + dos_nbands]) \
                                    + self.offset_from_vrun['n']
                 elif self.interpolation == "boltztrap2":
                     emesh, dos, dos_nbands = get_dos_boltztrap2(
@@ -1261,12 +1269,12 @@ class Amset(MSONable, LoggableMixin):
             for idx in range(self.cbm_dos_idx, self.get_Eidx_in_dos(
                     self.cbm_vbm["n"]["energy"] + 2.0)):
                 dos[idx] = max(dos[idx], free_e_dos(
-                    E=self.dos_emesh[idx] - self.cbm_vbm["n"]["energy"]))
+                    energy=self.dos_emesh[idx] - self.cbm_vbm["n"]["energy"]))
             for idx in range(
                     self.get_Eidx_in_dos(self.cbm_vbm["p"]["energy"] - 2.0),
                     self.vbm_dos_idx):
                 dos[idx] = max(dos[idx], free_e_dos(
-                    E=self.cbm_vbm["p"]["energy"] - self.dos_emesh[idx]))
+                    energy=self.cbm_vbm["p"]["energy"] - self.dos_emesh[idx]))
             for idos in range(self.dos_start, self.dos_end):
                 integ += (dos[idos + 1] + dos[idos]) / 2 * (
                         emesh[idos + 1] - emesh[idos])
@@ -1317,18 +1325,19 @@ class Amset(MSONable, LoggableMixin):
                 eref = {typ: self.cbm_vbm[typ]['energy'] for typ in ['p', 'n']}
             else:
                 eref = None
-            self.important_pts, new_cbm_vbm = get_bs_extrema(self.band_structure,
-                                                             coeff_file,
-                                                             interp_params=self.interp_params,
-                                                             method=interpolation,
-                                                             Ecut=self.Ecut,
-                                                             eref=eref,
-                                                             return_global=True,
-                                                             n_jobs=self.n_jobs,
-                                                             nbelow_vbm=nbelow_vbm,
-                                                             nabove_cbm=nabove_cbm,
-                                                             scissor=self.scissor,
-                                                             **kwargs)
+            self.important_pts, new_cbm_vbm = get_bs_extrema(
+                self.band_structure,
+                coeff_file,
+                interp_params=self.interp_params,
+                method=interpolation,
+                Ecut=self.Ecut,
+                eref=eref,
+                return_global=True,
+                n_jobs=self.n_jobs,
+                nbelow_vbm=nbelow_vbm,
+                nabove_cbm=nabove_cbm,
+                scissor=self.scissor,
+                **kwargs)
             if new_cbm_vbm['n']['energy'] < self.cbm_vbm['n'][
                 'energy'] and self.parabolic_bands0 is None:
                 self.cbm_vbm['n']['energy'] = new_cbm_vbm['n']['energy']
@@ -1988,8 +1997,9 @@ class Amset(MSONable, LoggableMixin):
             self.cbm_vbm[tp]["cartesian k"] = self.get_cartesian_coords(
                 self.cbm_vbm[tp]["kpoint"]) / A_to_nm
             self.cbm_vbm[tp]["all cartesian k"] = remove_duplicate_kpoints(
-                self.band_structure.get_sym_eq_kpoints(self.cbm_vbm[tp]["cartesian k"],
-                                                       cartesian=True))
+                self.band_structure.get_sym_eq_kpoints(
+                    self.cbm_vbm[tp]["cartesian k"],
+                    cartesian=True))
             sgn = (-1) ** i
             for ib in range(self.cbm_vbm[tp]["included"]):
                 for ik, k in enumerate(self.kgrid[tp]['kpoints'][ib]):
@@ -1997,9 +2007,9 @@ class Amset(MSONable, LoggableMixin):
                         self.get_cartesian_coords(
                             self.kgrid[tp]["kpoints"][ib][ik]) / A_to_nm
 
-                s_orbital, p_orbital = get_dft_orbitals(
-                    band_structure=self.band_structure,
-                    bidx=self.cbm_vbm[tp]["bidx"] - 1 - sgn * ib)
+                s_orbital, p_orbital = get_band_orbital_contributions(
+                    self.band_structure,
+                    self.cbm_vbm[tp]["bidx"] - 1 - sgn * ib)
                 orbitals = {"s": s_orbital, "p": p_orbital}
                 fit_orbs = {
                     orb: griddata(points=np.array(self.cartesian_kpoints),
@@ -2030,7 +2040,8 @@ class Amset(MSONable, LoggableMixin):
                 # compare to a for-loop this map reduce time and memory usage:
                 self.kgrid[tp]["cartesian kpoints"][ib] = list(
                     map(lambda k: self.get_cartesian_coords(get_closest_k(
-                        k, self.band_structure.get_sym_eq_kpoints(important_points[tp][0]),
+                        k, self.band_structure.get_sym_eq_kpoints(
+                            important_points[tp][0]),
                         return_diff=True)) / A_to_nm,
                         self.kgrid[tp]["kpoints"][ib]))
 
@@ -2836,7 +2847,7 @@ class Amset(MSONable, LoggableMixin):
             for c in self.dopings:
                 for T in self.temperatures:
                     for ib in range(len(self.kgrid[tp]["kpoints"])):
-                        results = [calculate_Sio(tp, c, T, ib, ik,
+                        results = [calculate_sio(tp, c, T, ib, ik,
                                                  once_called, self.kgrid,
                                                  self.cbm_vbm,
                                                  self.epsilon_s,

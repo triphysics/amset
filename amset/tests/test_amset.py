@@ -2,6 +2,8 @@
 
 import json
 import logging
+import warnings
+
 import numpy as np
 import os
 import shutil
@@ -12,6 +14,8 @@ from copy import deepcopy
 test_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'test_files')
 
 LOGLEVEL = logging.DEBUG
+
+warnings.simplefilter("ignore")
 
 
 class AmsetTest(unittest.TestCase):
@@ -126,12 +130,12 @@ class AmsetTest(unittest.TestCase):
 
         # just testing write to file methods:
         amset.as_dict()
-        amset.to_file(dir_name='run_data')
+        filepath = amset.to_file(directory='run_data')
         amset.to_csv()
         amset.grids_to_json()
 
         # deserialization test:
-        amset.from_file(path=os.path.join(amset.calc_dir, 'run_data'))
+        amset.from_file(filepath)
 
     def test_GaAs_anisotropic(self):
         expected_mu = {'ACD': 378435.7259,
